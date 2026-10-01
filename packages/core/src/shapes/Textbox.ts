@@ -385,6 +385,15 @@ export class Textbox<
    * @returns {number}
    */
   _measureWord(word: string[], lineIndex: number, charOffset = 0): number {
+    const contextualRuns = this._getContextualRtlRuns(
+      lineIndex,
+      word,
+      charOffset,
+    );
+    if (contextualRuns) {
+      return contextualRuns.reduce((total, run) => total + run.width, 0);
+    }
+
     let width = 0,
       prevGrapheme;
     const skipLeft = true;
