@@ -23,8 +23,8 @@
     'deltaY',
   ];
 
-  const sameRenderingStyle = (a, b) =>
-    styleKeys.every((key) => a[key] === b[key]);
+  const styleChanged = (a, b) =>
+    styleKeys.some((key) => a[key] !== b[key]);
 
   proto._measureLine = function (lineIndex) {
     const result = originalMeasureLine.call(this, lineIndex);
@@ -43,17 +43,19 @@
       return result;
     }
 
-    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
+    const runs = [];
+    let runStart = 0;
+    let runStyle = this.getCompleteStyleDeclaration(lineIndex, 0);
+
     for (let i = 1; i < line.length; i++) {
-      if (
-        !sameRenderingStyle(
-          style,
-          this.getCompleteStyleDeclaration(lineIndex, i),
-        )
-      ) {
-        return result;
+      const nextStyle = this.getCompleteStyleDeclaration(lineIndex, i);
+      if (styleChanged(runStyle, nextStyle)) {
+        runs.push({ start: runStart, end: i, style: runStyle });
+        runStart = i;
+        runStyle = nextStyle;
       }
     }
+    runs.push({ start: runStart, end: line.length, style: runStyle });
 
     const doc = document;
     const body = doc.body;
@@ -61,7 +63,15 @@
       return result;
     }
 
-    const value = line.join('');
+    const measuringCanvas = doc.createElement('canvas');
+    const ctx = measuringCanvas.getContext('2d');
+    if (!ctx) {
+      return result;
+    }
+
+    const candidate = new Array(line.length);
+    let accumulatedWidth = 0;
+
     const span = doc.createElement('span');
     span.dir = 'rtl';
     span.style.cssText = [
@@ -79,85 +89,98 @@
       'visibility: hidden',
       'pointer-events: none',
     ].join(';');
-    span.style.font = this._getFontDeclaration(style);
-    span.textContent = value;
     body.appendChild(span);
 
     try {
-      const node = span.firstChild;
-      if (!node) {
-        return result;
-      }
+      for (const run of runs) {
+        const runText = line.slice(run.start, run.end).join('');
+        span.style.font = this._getFontDeclaration(run.style);
+        span.textContent = runText;
 
-      const lineRect = span.getBoundingClientRect();
-      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
-        return result;
-      }
-
-      const range = doc.createRange();
-      if (typeof range.getBoundingClientRect !== 'function') {
-        return result;
-      }
-
-      const offsets = new Array(line.length + 1);
-      offsets[0] = 0;
-      offsets[line.length] = lineRect.width;
-
-      let utf16Offset = 0;
-      for (let i = 1; i < line.length; i++) {
-        utf16Offset += line[i - 1].length;
-        range.setStart(node, utf16Offset);
-        range.collapse(true);
-
-        const rect = range.getBoundingClientRect();
-        const offset = lineRect.right - rect.left;
-        if (
-          !Number.isFinite(offset) ||
-          offset < -0.5 ||
-          offset > lineRect.width + 0.5
-        ) {
+        const node = span.firstChild;
+        if (!node) {
           return result;
         }
-        offsets[i] = Math.max(0, Math.min(lineRect.width, offset));
-      }
 
-      for (let i = 1; i < offsets.length; i++) {
-        if (offsets[i] + 0.5 < offsets[i - 1]) {
+        const runRect = span.getBoundingClientRect();
+        if (!Number.isFinite(runRect.width) || runRect.width <= 0) {
           return result;
         }
-        offsets[i] = Math.max(offsets[i], offsets[i - 1]);
-      }
 
-      const measuringCanvas = doc.createElement('canvas');
-      const ctx = measuringCanvas.getContext('2d');
-      if (!ctx) {
-        return result;
-      }
+        const range = doc.createRange();
+        if (typeof range.getBoundingClientRect !== 'function') {
+          return result;
+        }
 
-      ctx.font = this._getFontDeclaration(style, true);
-      const runWidth =
-        ctx.measureText(value).width * (style.fontSize / this.CACHE_FONT_SIZE);
-      if (!Number.isFinite(runWidth) || runWidth <= 0) {
-        return result;
-      }
+        const runLength = run.end - run.start;
+        const offsets = new Array(runLength + 1);
+        offsets[0] = 0;
+        offsets[runLength] = runRect.width;
 
-      const scale = runWidth / lineRect.width;
-      for (let i = 0; i < offsets.length; i++) {
-        offsets[i] *= scale;
+        let utf16Offset = 0;
+        for (let i = 1; i < runLength; i++) {
+          utf16Offset += line[run.start + i - 1].length;
+          range.setStart(node, utf16Offset);
+          range.collapse(true);
+
+          const rect = range.getBoundingClientRect();
+          const offset = runRect.right - rect.left;
+          if (
+            !Number.isFinite(offset) ||
+            offset < -0.5 ||
+            offset > runRect.width + 0.5
+          ) {
+            return result;
+          }
+          offsets[i] = Math.max(0, Math.min(runRect.width, offset));
+        }
+
+        for (let i = 1; i < offsets.length; i++) {
+          if (offsets[i] + 0.5 < offsets[i - 1]) {
+            return result;
+          }
+          offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+        }
+
+        ctx.font = this._getFontDeclaration(run.style, true);
+        const runWidth =
+          ctx.measureText(runText).width *
+          (run.style.fontSize / this.CACHE_FONT_SIZE);
+        if (!Number.isFinite(runWidth) || runWidth <= 0) {
+          return result;
+        }
+
+        const scale = runWidth / runRect.width;
+        for (let i = 0; i < offsets.length; i++) {
+          offsets[i] *= scale;
+        }
+
+        for (let i = 0; i < runLength; i++) {
+          const left = accumulatedWidth + offsets[i];
+          const advance = offsets[i + 1] - offsets[i];
+          candidate[run.start + i] = {
+            left,
+            width: advance,
+            kernedWidth: advance,
+          };
+        }
+
+        accumulatedWidth += runWidth;
       }
 
       const lineBounds = this.__charBounds[lineIndex];
       for (let i = 0; i < line.length; i++) {
-        const left = offsets[i];
-        const advance = offsets[i + 1] - left;
-        lineBounds[i].left = left;
-        lineBounds[i].width = advance;
-        lineBounds[i].kernedWidth = advance;
+        const geometry = candidate[i];
+        if (!geometry) {
+          return result;
+        }
+        lineBounds[i].left = geometry.left;
+        lineBounds[i].width = geometry.width;
+        lineBounds[i].kernedWidth = geometry.kernedWidth;
       }
 
-      lineBounds[line.length].left = runWidth;
-      result.width = runWidth;
-
+      lineBounds[line.length].left = accumulatedWidth;
+      result.width = accumulatedWidth;
       return result;
     } finally {
       span.remove();
@@ -165,7 +188,8 @@
   };
 
   window.__fabricRtlContextualCharBoundsPatch = {
-    commit: '28637abecdfd59248ca613cb33f06d184fc352ea',
+    commit: '80d72455b6bee72d6882084e4968cb0a23637ab4',
     applied: true,
+    runAware: true,
   };
 })();
