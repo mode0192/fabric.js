@@ -121,6 +121,20 @@ export type GraphemeBBox = {
   angle?: number;
 };
 
+/**
+ * A contiguous group of graphemes that Fabric renders in one canvas text call.
+ *
+ * Contextual scripts must be measured at this level because shaping can depend
+ * on more than the current and previous grapheme.
+ */
+export type ContextualTextRun = {
+  start: number;
+  end: number;
+  text: string;
+  width: number;
+  style: CompleteTextStyleDeclaration;
+};
+
 // @TODO this is not complete
 interface UniqueTextProps {
   charSpacing: number;
@@ -904,6 +918,79 @@ export class FabricText<
   }
 
   /**
+   * Returns the contextual RTL runs used by the renderer together with their
+   * canvas-measured widths.
+   *
+   * __charBounds is intentionally not rewritten here. It represents Fabric's
+   * legacy grapheme boxes and is also consumed by rendering/layout code with
+   * semantics that are different from caret boundaries. Contextual run
+   * geometry is kept separate so complex-script shaping does not overload
+   * those fields.
+   */
+  protected _getContextualRtlRuns(
+    lineIndex: number,
+    line: string[],
+    charOffset = 0,
+  ): ContextualTextRun[] | undefined {
+    if (
+      this.direction !== RTL ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes(JUSTIFY) ||
+      line.length === 0
+    ) {
+      return;
+    }
+
+    const ctx = getMeasuringContext();
+    if (!ctx) {
+      return;
+    }
+
+    const runs: ContextualTextRun[] = [];
+    let runStart = 0;
+    let runStyle = this.getCompleteStyleDeclaration(
+      lineIndex,
+      charOffset,
+    );
+
+    const pushRun = (end: number) => {
+      const text = line.slice(runStart, end).join('');
+      this._setTextStyles(ctx, runStyle, true);
+      const width =
+        ctx.measureText(text).width *
+        (runStyle.fontSize / this.CACHE_FONT_SIZE);
+      runs.push({
+        start: runStart,
+        end,
+        text,
+        width,
+        style: runStyle,
+      });
+    };
+
+    // Keep the same run boundaries as _renderChars.
+    for (let i = 1; i < line.length; i++) {
+      const nextStyle = this.getCompleteStyleDeclaration(
+        lineIndex,
+        charOffset + i,
+      );
+      if (hasStyleChanged(runStyle, nextStyle, false)) {
+        pushRun(i);
+        runStart = i;
+        runStyle = nextStyle;
+      }
+    }
+    pushRun(line.length);
+
+    return runs.every(
+      ({ width }) => Number.isFinite(width) && width >= 0,
+    )
+      ? runs
+      : undefined;
+  }
+
+  /**
    * measure every grapheme of a line, populating __charBounds
    * @param {Number} lineIndex
    * @return {Object} object.width total width of characters
@@ -937,6 +1024,15 @@ export class FabricText<
       height: this.fontSize,
       deltaY: 0,
     };
+
+    const contextualRuns = this._getContextualRtlRuns(
+      lineIndex,
+      line,
+    );
+    if (contextualRuns) {
+      width = contextualRuns.reduce((total, run) => total + run.width, 0);
+    }
+
     if (path && path.segmentsInfo) {
       let positionInPath = 0;
       const totalPathLength =
@@ -1203,6 +1299,29 @@ export class FabricText<
       ctx.textAlign = isLtr ? LEFT : RIGHT;
     }
     top -= this.getHeightOfLineImpl(lineIndex) * this._fontSizeFraction;
+
+    const contextualRuns = this._getContextualRtlRuns(
+      lineIndex,
+      line,
+    );
+    if (contextualRuns) {
+      let runLeft = left;
+      for (const run of contextualRuns) {
+        this._renderChar(
+          method,
+          ctx,
+          lineIndex,
+          run.start,
+          run.text,
+          runLeft,
+          top,
+        );
+        runLeft -= run.width;
+      }
+      ctx.restore();
+      return;
+    }
+
     if (shortCut) {
       // render all the line in one pass without checking
       // drawingLeft = isLtr ? left : left - this.getLineWidth(lineIndex);
