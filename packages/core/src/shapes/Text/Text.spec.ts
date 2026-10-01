@@ -14,6 +14,7 @@ import {
   Textbox,
 } from '../../../../../fabric';
 import { toFixed } from '../../util';
+import { hasStyleChanged } from '../../util/misc/textStyles';
 import {
   createReferenceObject,
   createSVGElement,
@@ -111,10 +112,14 @@ describe('FabricText', () => {
     });
 
     describe('contextual RTL geometry', () => {
-      const browserOffsets = (text: FabricText) => {
+      const measureBrowserRun = (
+        text: FabricText,
+        start: number,
+        end: number,
+      ) => {
         const doc = getFabricDocument();
         const line = text._textLines[0];
-        const style = text.getCompleteStyleDeclaration(0, 0);
+        const style = text.getCompleteStyleDeclaration(0, start);
         const span = doc.createElement('span');
         span.dir = 'rtl';
         span.style.cssText = [
@@ -129,31 +134,66 @@ describe('FabricText', () => {
           'visibility: hidden',
         ].join(';');
         span.style.font = text._getFontDeclaration(style);
-        span.textContent = line.join('');
+        span.textContent = line.slice(start, end).join('');
         doc.body.appendChild(span);
 
         try {
           const node = span.firstChild!;
-          const lineRect = span.getBoundingClientRect();
+          const runRect = span.getBoundingClientRect();
           const range = doc.createRange();
-          const offsets = new Array<number>(line.length + 1);
+          const offsets = new Array<number>(end - start + 1);
           offsets[0] = 0;
-          offsets[line.length] = lineRect.width;
+          offsets[end - start] = runRect.width;
 
           let utf16Offset = 0;
-          for (let i = 1; i < line.length; i++) {
-            utf16Offset += line[i - 1].length;
+          for (let i = 1; i < end - start; i++) {
+            utf16Offset += line[start + i - 1].length;
             range.setStart(node, utf16Offset);
             range.collapse(true);
-            offsets[i] =
-              lineRect.right - range.getBoundingClientRect().left;
+            offsets[i] = runRect.right - range.getBoundingClientRect().left;
           }
 
-          const measuredWidth = text.measureLine(0).width;
-          return offsets.map((offset) => (offset * measuredWidth) / lineRect.width);
+          const canvas = doc.createElement('canvas');
+          const ctx = canvas.getContext('2d')!;
+          ctx.font = text._getFontDeclaration(style, true);
+          const runWidth =
+            ctx.measureText(line.slice(start, end).join('')).width *
+            (style.fontSize / text.CACHE_FONT_SIZE);
+
+          return offsets.map((offset) => (offset * runWidth) / runRect.width);
         } finally {
           span.remove();
         }
+      };
+
+      const browserOffsets = (text: FabricText) => {
+        const line = text._textLines[0];
+        const runs: Array<{ start: number; end: number }> = [];
+        let runStart = 0;
+        let runStyle = text.getCompleteStyleDeclaration(0, 0);
+
+        for (let i = 1; i < line.length; i++) {
+          const nextStyle = text.getCompleteStyleDeclaration(0, i);
+          if (hasStyleChanged(runStyle, nextStyle, false)) {
+            runs.push({ start: runStart, end: i });
+            runStart = i;
+            runStyle = nextStyle;
+          }
+        }
+        runs.push({ start: runStart, end: line.length });
+
+        const offsets = new Array<number>(line.length + 1);
+        let accumulatedWidth = 0;
+
+        for (const run of runs) {
+          const runOffsets = measureBrowserRun(text, run.start, run.end);
+          for (let i = 0; i < runOffsets.length - 1; i++) {
+            offsets[run.start + i] = accumulatedWidth + runOffsets[i];
+          }
+          accumulatedWidth += runOffsets[runOffsets.length - 1];
+        }
+        offsets[line.length] = accumulatedWidth;
+        return offsets;
       };
 
       it('populates __charBounds from the fully shaped Arabic run', (context) => {
@@ -213,7 +253,7 @@ describe('FabricText', () => {
         });
       });
 
-      it('keeps the existing geometry when a style change splits the render run', (context) => {
+      it('measures each styled render run in contextual shaping', (context) => {
         context.skip(isJSDOM());
 
         const text = new FabricText('المهنة', {
@@ -229,12 +269,20 @@ describe('FabricText', () => {
             },
           },
         });
+        const expected = browserOffsets(text);
 
         text.measureLine(0);
         const bounds = text.__charBounds[0];
 
-        expect(bounds[3].left).toBeGreaterThanOrEqual(bounds[2].left);
-        expect(bounds[text._textLines[0].length].left).toBeGreaterThan(0);
+        expected.forEach((offset, index) => {
+          expect(bounds[index].left).toBeCloseTo(offset, 1);
+        });
+        for (let i = 0; i < text._textLines[0].length; i++) {
+          expect(bounds[i].kernedWidth).toBeCloseTo(
+            expected[i + 1] - expected[i],
+            1,
+          );
+        }
       });
     });
   });
