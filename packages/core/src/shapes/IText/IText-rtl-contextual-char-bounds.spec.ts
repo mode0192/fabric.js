@@ -109,6 +109,32 @@ describe('IText contextual RTL char bounds', () => {
     }
   });
 
+  it('keeps contextual geometry after moving text with complete drag styles', (context) => {
+    context.skip(isJSDOM());
+
+    const text = createArabicText();
+    const movedStart = 2;
+    const movedEnd = 3;
+    const moved = text._text.slice(movedStart, movedEnd).join('');
+    const dragStyles = text.getSelectionStyles(movedStart, movedEnd, true);
+
+    text.removeChars(movedStart, movedEnd);
+    text.insertChars(moved, dragStyles, 0);
+
+    expect(text.isEmptyStyles(0)).toBe(false);
+
+    const offsets = browserOffsets(text);
+    const bounds = text.__charBounds[0];
+
+    offsets.forEach((offset, index) => {
+      expect(bounds[index].left).toBeCloseTo(offset, 1);
+      expect(-text._getCursorBoundaries(index, true).leftOffset).toBeCloseTo(
+        offset,
+        1,
+      );
+    });
+  });
+
   it('renders selection between contextual char boundaries', (context) => {
     context.skip(isJSDOM());
 
