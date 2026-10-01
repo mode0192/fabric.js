@@ -914,6 +914,19 @@ export class FabricText<
    * The optimization is intentionally limited to lines that Fabric renders as
    * one run. More complex layouts keep the existing pair-wise measurement.
    */
+  /**
+   * Measures RTL text using the same shaping runs used by _renderChars.
+   *
+   * Fabric normally builds __charBounds from isolated grapheme/pair
+   * measurements, while the renderer can draw several graphemes together in a
+   * single fillText/strokeText call. Contextual scripts such as Arabic can
+   * therefore render with geometry that does not match __charBounds.
+   *
+   * Recreate the renderer's style runs, measure each run in full shaping
+   * context, and concatenate those run advances into __charBounds. This keeps
+   * measurement and rendering in the same model even when inline styles split
+   * a line into multiple draw calls.
+   */
   private _measureRtlLineInContext(
     lineIndex: number,
     line: string[],
@@ -929,30 +942,42 @@ export class FabricText<
       return;
     }
 
-    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
-
-    // _renderChars keeps appending graphemes while their effective rendering
-    // style is unchanged. Only replace geometry when the entire line follows
-    // that same single-run path.
-    for (let i = 1; i < line.length; i++) {
-      if (
-        hasStyleChanged(
-          style,
-          this.getCompleteStyleDeclaration(lineIndex, i),
-          false,
-        )
-      ) {
-        return;
-      }
-    }
-
     const doc = getFabricDocument();
     const body = doc.body;
-    if (!body || typeof doc.createRange !== 'function') {
+    const ctx = getMeasuringContext();
+    if (!body || !ctx || typeof doc.createRange !== 'function') {
       return;
     }
 
-    const value = line.join('');
+    type Run = {
+      start: number;
+      end: number;
+      style: CompleteTextStyleDeclaration;
+    };
+
+    const runs: Run[] = [];
+    let runStart = 0;
+    let runStyle = this.getCompleteStyleDeclaration(lineIndex, 0);
+
+    // Match _renderChars: a new draw call starts whenever hasStyleChanged()
+    // reports a rendering-style boundary.
+    for (let i = 1; i < line.length; i++) {
+      const nextStyle = this.getCompleteStyleDeclaration(lineIndex, i);
+      if (hasStyleChanged(runStyle, nextStyle, false)) {
+        runs.push({ start: runStart, end: i, style: runStyle });
+        runStart = i;
+        runStyle = nextStyle;
+      }
+    }
+    runs.push({ start: runStart, end: line.length, style: runStyle });
+
+    const candidate = new Array<{
+      left: number;
+      width: number;
+      kernedWidth: number;
+    }>(line.length);
+    let accumulatedWidth = 0;
+
     const span = doc.createElement('span');
     span.dir = RTL;
     span.style.cssText = [
@@ -970,87 +995,104 @@ export class FabricText<
       'visibility: hidden',
       'pointer-events: none',
     ].join(';');
-    span.style.font = this._getFontDeclaration(style);
-    span.textContent = value;
     body.appendChild(span);
 
     try {
-      const node = span.firstChild;
-      if (!node) {
-        return;
-      }
+      for (const run of runs) {
+        const runText = line.slice(run.start, run.end).join('');
+        span.style.font = this._getFontDeclaration(run.style);
+        span.textContent = runText;
 
-      const lineRect = span.getBoundingClientRect();
-      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
-        return;
-      }
-
-      const range = doc.createRange();
-      if (typeof range.getBoundingClientRect !== 'function') {
-        return;
-      }
-
-      const offsets = new Array<number>(line.length + 1);
-      offsets[0] = 0;
-      offsets[line.length] = lineRect.width;
-
-      let utf16Offset = 0;
-      for (let i = 1; i < line.length; i++) {
-        utf16Offset += line[i - 1].length;
-        range.setStart(node, utf16Offset);
-        range.collapse(true);
-
-        const rect = range.getBoundingClientRect();
-        const offset = lineRect.right - rect.left;
-        if (
-          !Number.isFinite(offset) ||
-          offset < -0.5 ||
-          offset > lineRect.width + 0.5
-        ) {
+        const node = span.firstChild;
+        if (!node) {
           return;
         }
-        offsets[i] = Math.max(0, Math.min(lineRect.width, offset));
-      }
 
-      // __charBounds represents logical advances, therefore it cannot encode a
-      // run whose logical cursor positions move backwards (mixed BiDi affinity).
-      // Keep the existing geometry for that case instead of corrupting it.
-      for (let i = 1; i < offsets.length; i++) {
-        if (offsets[i] + 0.5 < offsets[i - 1]) {
+        const runRect = span.getBoundingClientRect();
+        if (!Number.isFinite(runRect.width) || runRect.width <= 0) {
           return;
         }
-        offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+
+        const range = doc.createRange();
+        if (typeof range.getBoundingClientRect !== 'function') {
+          return;
+        }
+
+        const runLength = run.end - run.start;
+        const offsets = new Array<number>(runLength + 1);
+        offsets[0] = 0;
+        offsets[runLength] = runRect.width;
+
+        let utf16Offset = 0;
+        for (let i = 1; i < runLength; i++) {
+          utf16Offset += line[run.start + i - 1].length;
+          range.setStart(node, utf16Offset);
+          range.collapse(true);
+
+          const rect = range.getBoundingClientRect();
+          const offset = runRect.right - rect.left;
+          if (
+            !Number.isFinite(offset) ||
+            offset < -0.5 ||
+            offset > runRect.width + 0.5
+          ) {
+            return;
+          }
+          offsets[i] = Math.max(0, Math.min(runRect.width, offset));
+        }
+
+        // __charBounds stores logical advances. Mixed BiDi caret affinity can
+        // move backwards inside a run and cannot be represented by this model.
+        for (let i = 1; i < offsets.length; i++) {
+          if (offsets[i] + 0.5 < offsets[i - 1]) {
+            return;
+          }
+          offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+        }
+
+        this._setTextStyles(ctx, run.style, true);
+        const fontMultiplier = run.style.fontSize / this.CACHE_FONT_SIZE;
+        const runWidth = ctx.measureText(runText).width * fontMultiplier;
+        if (!Number.isFinite(runWidth) || runWidth <= 0) {
+          return;
+        }
+
+        // DOM Range gives us the internal caret positions. Canvas owns the
+        // actual width Fabric renders, so normalize the DOM offsets to that
+        // width before committing the geometry.
+        const scale = runWidth / runRect.width;
+        for (let i = 0; i < offsets.length; i++) {
+          offsets[i] *= scale;
+        }
+
+        for (let i = 0; i < runLength; i++) {
+          const left = accumulatedWidth + offsets[i];
+          const advance = offsets[i + 1] - offsets[i];
+          candidate[run.start + i] = {
+            left,
+            width: advance,
+            kernedWidth: advance,
+          };
+        }
+
+        accumulatedWidth += runWidth;
       }
 
-      const ctx = getMeasuringContext();
-      if (!ctx) {
-        return;
-      }
-      this._setTextStyles(ctx, style, true);
-      const fontMultiplier = style.fontSize / this.CACHE_FONT_SIZE;
-      const runWidth = ctx.measureText(value).width * fontMultiplier;
-      if (!Number.isFinite(runWidth) || runWidth <= 0) {
-        return;
-      }
-
-      // DOM and canvas text layout can differ by a fraction of a pixel.
-      // Canvas owns Fabric's rendered width, so normalize the DOM caret
-      // positions to that width before storing them in __charBounds.
-      const scale = runWidth / lineRect.width;
-      for (let i = 0; i < offsets.length; i++) {
-        offsets[i] *= scale;
-      }
-
+      // Commit only after every run has been measured successfully. If a
+      // browser cannot provide coherent geometry for any run, keep Fabric's
+      // original pair-wise bounds for the entire line.
       for (let i = 0; i < line.length; i++) {
-        const left = offsets[i];
-        const advance = offsets[i + 1] - left;
-        lineBounds[i].left = left;
-        lineBounds[i].width = advance;
-        lineBounds[i].kernedWidth = advance;
+        const geometry = candidate[i];
+        if (!geometry) {
+          return;
+        }
+        lineBounds[i].left = geometry.left;
+        lineBounds[i].width = geometry.width;
+        lineBounds[i].kernedWidth = geometry.kernedWidth;
       }
 
-      lineBounds[line.length].left = runWidth;
-      return runWidth;
+      lineBounds[line.length].left = accumulatedWidth;
+      return accumulatedWidth;
     } finally {
       span.remove();
     }
