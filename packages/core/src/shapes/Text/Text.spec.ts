@@ -1,4 +1,4 @@
-import { roundSnapshotOptions } from '../../../../../vitest.extend';
+import { isJSDOM, roundSnapshotOptions } from '../../../../../vitest.extend';
 import { cache } from '../../cache';
 import { config } from '../../config';
 import { Path } from '../Path';
@@ -108,6 +108,134 @@ describe('FabricText', () => {
     it('splits into lines', () => {
       const text = new FabricText('test foo bar-baz\nqux');
       expect(text._splitTextIntoLines(text.text)).toMatchSnapshot();
+    });
+
+    describe('contextual RTL geometry', () => {
+      const browserOffsets = (text: FabricText) => {
+        const doc = getFabricDocument();
+        const line = text._textLines[0];
+        const style = text.getCompleteStyleDeclaration(0, 0);
+        const span = doc.createElement('span');
+        span.dir = 'rtl';
+        span.style.cssText = [
+          'all: initial',
+          'position: fixed',
+          'left: -100000px',
+          'top: 0',
+          'display: inline-block',
+          'white-space: pre',
+          'direction: rtl',
+          'unicode-bidi: isolate',
+          'visibility: hidden',
+        ].join(';');
+        span.style.font = text._getFontDeclaration(style);
+        span.textContent = line.join('');
+        doc.body.appendChild(span);
+
+        try {
+          const node = span.firstChild!;
+          const lineRect = span.getBoundingClientRect();
+          const range = doc.createRange();
+          const offsets = new Array<number>(line.length + 1);
+          offsets[0] = 0;
+          offsets[line.length] = lineRect.width;
+
+          let utf16Offset = 0;
+          for (let i = 1; i < line.length; i++) {
+            utf16Offset += line[i - 1].length;
+            range.setStart(node, utf16Offset);
+            range.collapse(true);
+            offsets[i] =
+              lineRect.right - range.getBoundingClientRect().left;
+          }
+
+          const measuredWidth = text.measureLine(0).width;
+          return offsets.map((offset) => (offset * measuredWidth) / lineRect.width);
+        } finally {
+          span.remove();
+        }
+      };
+
+      it('populates __charBounds from the fully shaped Arabic run', (context) => {
+        context.skip(isJSDOM());
+
+        const text = new FabricText('المهنة', {
+          direction: 'rtl',
+          textAlign: 'right',
+          fontFamily: 'Arial',
+          fontSize: 64,
+        });
+        const expected = browserOffsets(text);
+
+        text.measureLine(0);
+        const bounds = text.__charBounds[0];
+
+        expected.forEach((offset, index) => {
+          expect(bounds[index].left).toBeCloseTo(offset, 1);
+        });
+        for (let i = 0; i < text._textLines[0].length; i++) {
+          expect(bounds[i].kernedWidth).toBeCloseTo(
+            expected[i + 1] - expected[i],
+            1,
+          );
+          expect(bounds[i].width).toBeCloseTo(
+            expected[i + 1] - expected[i],
+            1,
+          );
+        }
+      });
+
+      it('uses contextual geometry when explicit styles do not split the render run', (context) => {
+        context.skip(isJSDOM());
+
+        const text = new FabricText('المهنة', {
+          direction: 'rtl',
+          textAlign: 'right',
+          fontFamily: 'Arial',
+          fontSize: 64,
+          styles: {
+            0: {
+              2: {
+                fontFamily: 'Arial',
+                fontSize: 64,
+                fill: 'rgb(0,0,0)',
+              },
+            },
+          },
+        });
+        const expected = browserOffsets(text);
+
+        text.measureLine(0);
+        const bounds = text.__charBounds[0];
+
+        expected.forEach((offset, index) => {
+          expect(bounds[index].left).toBeCloseTo(offset, 1);
+        });
+      });
+
+      it('keeps the existing geometry when a style change splits the render run', (context) => {
+        context.skip(isJSDOM());
+
+        const text = new FabricText('المهنة', {
+          direction: 'rtl',
+          textAlign: 'right',
+          fontFamily: 'Arial',
+          fontSize: 64,
+          styles: {
+            0: {
+              2: {
+                fontFamily: 'serif',
+              },
+            },
+          },
+        });
+
+        text.measureLine(0);
+        const bounds = text.__charBounds[0];
+
+        expect(bounds[3].left).toBeGreaterThanOrEqual(bounds[2].left);
+        expect(bounds[text._textLines[0].length].left).toBeGreaterThan(0);
+      });
     });
   });
 

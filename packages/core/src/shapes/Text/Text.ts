@@ -904,6 +904,159 @@ export class FabricText<
   }
 
   /**
+   * Measures an RTL line in the same contextual run used by the renderer.
+   *
+   * CanvasRenderingContext2D exposes the width of the fully shaped run but not
+   * its internal caret positions. DOM Range does expose those positions while
+   * preserving the complete shaping context, so use it to derive grapheme
+   * advances and normalize them to the canvas-measured run width.
+   *
+   * The optimization is intentionally limited to lines that Fabric renders as
+   * one run. More complex layouts keep the existing pair-wise measurement.
+   */
+  private _measureRtlLineInContext(
+    lineIndex: number,
+    line: string[],
+    lineBounds: GraphemeBBox[],
+  ): number | undefined {
+    if (
+      this.direction !== RTL ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes(JUSTIFY) ||
+      line.length === 0
+    ) {
+      return;
+    }
+
+    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
+
+    // _renderChars keeps appending graphemes while their effective rendering
+    // style is unchanged. Only replace geometry when the entire line follows
+    // that same single-run path.
+    for (let i = 1; i < line.length; i++) {
+      if (
+        hasStyleChanged(
+          style,
+          this.getCompleteStyleDeclaration(lineIndex, i),
+          false,
+        )
+      ) {
+        return;
+      }
+    }
+
+    const doc = getFabricDocument();
+    const body = doc.body;
+    if (!body || typeof doc.createRange !== 'function') {
+      return;
+    }
+
+    const value = line.join('');
+    const span = doc.createElement('span');
+    span.dir = RTL;
+    span.style.cssText = [
+      'all: initial',
+      'position: fixed',
+      'left: -100000px',
+      'top: 0',
+      'display: inline-block',
+      'margin: 0',
+      'padding: 0',
+      'border: 0',
+      'white-space: pre',
+      'direction: rtl',
+      'unicode-bidi: isolate',
+      'visibility: hidden',
+      'pointer-events: none',
+    ].join(';');
+    span.style.font = this._getFontDeclaration(style);
+    span.textContent = value;
+    body.appendChild(span);
+
+    try {
+      const node = span.firstChild;
+      if (!node) {
+        return;
+      }
+
+      const lineRect = span.getBoundingClientRect();
+      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
+        return;
+      }
+
+      const range = doc.createRange();
+      if (typeof range.getBoundingClientRect !== 'function') {
+        return;
+      }
+
+      const offsets = new Array<number>(line.length + 1);
+      offsets[0] = 0;
+      offsets[line.length] = lineRect.width;
+
+      let utf16Offset = 0;
+      for (let i = 1; i < line.length; i++) {
+        utf16Offset += line[i - 1].length;
+        range.setStart(node, utf16Offset);
+        range.collapse(true);
+
+        const rect = range.getBoundingClientRect();
+        const offset = lineRect.right - rect.left;
+        if (
+          !Number.isFinite(offset) ||
+          offset < -0.5 ||
+          offset > lineRect.width + 0.5
+        ) {
+          return;
+        }
+        offsets[i] = Math.max(0, Math.min(lineRect.width, offset));
+      }
+
+      // __charBounds represents logical advances, therefore it cannot encode a
+      // run whose logical cursor positions move backwards (mixed BiDi affinity).
+      // Keep the existing geometry for that case instead of corrupting it.
+      for (let i = 1; i < offsets.length; i++) {
+        if (offsets[i] + 0.5 < offsets[i - 1]) {
+          return;
+        }
+        offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+      }
+
+      const ctx = getMeasuringContext();
+      if (!ctx) {
+        return;
+      }
+      this._setTextStyles(ctx, style, true);
+      const fontMultiplier = style.fontSize / this.CACHE_FONT_SIZE;
+      const runWidth = ctx.measureText(value).width * fontMultiplier;
+      if (!Number.isFinite(runWidth) || runWidth <= 0) {
+        return;
+      }
+
+      // DOM and canvas text layout can differ by a fraction of a pixel.
+      // Canvas owns Fabric's rendered width, so normalize the DOM caret
+      // positions to that width before storing them in __charBounds.
+      const scale = runWidth / lineRect.width;
+      for (let i = 0; i < offsets.length; i++) {
+        offsets[i] *= scale;
+      }
+
+      for (let i = 0; i < line.length; i++) {
+        const left = offsets[i];
+        const advance = offsets[i + 1] - left;
+        lineBounds[i].left = left;
+        lineBounds[i].width = advance;
+        lineBounds[i].kernedWidth = advance;
+      }
+
+      lineBounds[line.length].left = runWidth;
+      return runWidth;
+    } finally {
+      span.remove();
+    }
+  }
+
+  /**
    * measure every grapheme of a line, populating __charBounds
    * @param {Number} lineIndex
    * @return {Object} object.width total width of characters
@@ -937,6 +1090,10 @@ export class FabricText<
       height: this.fontSize,
       deltaY: 0,
     };
+
+    width =
+      this._measureRtlLineInContext(lineIndex, line, lineBounds) ?? width;
+
     if (path && path.segmentsInfo) {
       let positionInPath = 0;
       const totalPathLength =
