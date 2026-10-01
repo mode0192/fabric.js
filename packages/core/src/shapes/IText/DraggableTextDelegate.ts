@@ -278,7 +278,7 @@ export class DraggableTextDelegate {
       const target = this.target;
       const canvas = target.canvas!;
       let insertAt = target.getSelectionStartFromPointer(e);
-      const { styles } = (
+      let { styles } = (
         e.dataTransfer!.types.includes('application/fabric')
           ? JSON.parse(e.dataTransfer!.getData('application/fabric'))
           : {}
@@ -289,6 +289,18 @@ export class DraggableTextDelegate {
       if (this.__dragStartSelection) {
         const selectionStart = this.__dragStartSelection.selectionStart;
         const selectionEnd = this.__dragStartSelection.selectionEnd;
+
+        // application/fabric carries complete styles so cross-object drops
+        // retain their appearance. Reusing those complete declarations for a
+        // move inside the same object, however, materializes object defaults as
+        // per-character styles. Apart from bloating the style map, that can
+        // split contextually-shaped scripts into separate render runs.
+        //
+        // For an in-place move preserve only the source's explicit styles.
+        styles = target
+          .getSelectionStyles(selectionStart, selectionEnd)
+          .map((style) => ({ ...style }));
+
         if (insertAt > selectionStart && insertAt <= selectionEnd) {
           insertAt = selectionStart;
         } else if (insertAt > selectionEnd) {
