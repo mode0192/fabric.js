@@ -507,13 +507,19 @@ export class IText<
       topOffset += this.getHeightOfLine(i);
     }
     const lineLeftOffset = this._getLineLeftOffset(lineIndex);
-    const bound = this.__charBounds[lineIndex][charIndex];
-    bound && (leftOffset = bound.left);
-    if (
-      this.charSpacing !== 0 &&
-      charIndex === this._textLines[lineIndex].length
-    ) {
-      leftOffset -= this._getWidthOfCharSpacing();
+    const rtlOffsets =
+      direction === RTL ? this._getRtlCursorOffsets(lineIndex) : undefined;
+    if (rtlOffsets) {
+      leftOffset = rtlOffsets[charIndex] ?? 0;
+    } else {
+      const bound = this.__charBounds[lineIndex][charIndex];
+      bound && (leftOffset = bound.left);
+      if (
+        this.charSpacing !== 0 &&
+        charIndex === this._textLines[lineIndex].length
+      ) {
+        leftOffset -= this._getWidthOfCharSpacing();
+      }
     }
     let left = lineLeftOffset + (leftOffset > 0 ? leftOffset : 0);
 
@@ -670,20 +676,27 @@ export class IText<
 
     for (let i = startLine; i <= endLine; i++) {
       const lineOffset = this._getLineLeftOffset(i) || 0;
+      const rtlOffsets =
+        direction === RTL ? this._getRtlCursorOffsets(i) : undefined;
       let lineHeight = this.getHeightOfLine(i),
         boxStart = 0,
         boxEnd = 0;
 
       if (i === startLine) {
-        boxStart = this.__charBounds[startLine][startChar].left;
+        boxStart =
+          rtlOffsets?.[startChar] ??
+          this.__charBounds[startLine][startChar].left;
       }
       if (i >= startLine && i < endLine) {
         boxEnd =
           isJustify && !this.isEndOfWrapping(i)
             ? this.width
-            : this.getLineWidth(i) || 5; // WTF is this 5?
+            : (rtlOffsets?.[this._textLines[i].length] ??
+              (this.getLineWidth(i) || 5)); // WTF is this 5?
       } else if (i === endLine) {
-        if (endChar === 0) {
+        if (rtlOffsets) {
+          boxEnd = rtlOffsets[endChar] ?? 0;
+        } else if (endChar === 0) {
           boxEnd = this.__charBounds[endLine][endChar].left;
         } else {
           const charSpacing = this._getWidthOfCharSpacing();

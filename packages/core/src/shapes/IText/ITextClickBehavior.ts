@@ -216,10 +216,14 @@ export abstract class ITextClickBehavior<
     const chars = this.__charBounds[lineIndex];
     const isRtl = this.direction === 'rtl';
     const effectiveX = isRtl ? lineLeftOffset - mouseOffset.x : mouseOffset.x;
-    let width = isRtl ? 0 : Math.abs(lineLeftOffset);
+    const rtlOffsets = isRtl
+      ? this._getRtlCursorOffsets(lineIndex)
+      : undefined;
+    let width = rtlOffsets?.[0] ?? (isRtl ? 0 : Math.abs(lineLeftOffset));
     for (let j = 0; j < charLength; j++) {
-      const charWidth = chars[j].kernedWidth;
-      const widthAfter = width + charWidth;
+      const widthAfter = rtlOffsets
+        ? rtlOffsets[j + 1]
+        : width + chars[j].kernedWidth;
       if (effectiveX <= widthAfter) {
         if (Math.abs(effectiveX - widthAfter) <= Math.abs(effectiveX - width)) {
           charIndex++;

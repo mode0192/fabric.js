@@ -8,8 +8,9 @@ import type { ValueAnimation } from '../../util/animation/ValueAnimation';
 import type { TextStyleDeclaration } from '../Text/StyledText';
 import type { SerializedTextProps, TextProps } from '../Text/Text';
 import type { TOptions, TOriginX } from '../../typedefs';
+import { getFabricDocument } from '../../env';
 import { getDocumentFromElement } from '../../util/dom_misc';
-import { LEFT, LTR, MODIFIED, RIGHT, reNewline } from '../../constants';
+import { LEFT, LTR, MODIFIED, RIGHT, RTL, reNewline } from '../../constants';
 import type { IText } from './IText';
 import { JUSTIFY } from '../Text/constants';
 
@@ -33,6 +34,13 @@ export type ITextEvents = ObjectEvents & {
   changed: never | { index: number; action: string };
   'editing:entered': never | { e: TPointerEvent };
   'editing:exited': never;
+};
+
+type RtlLineCursorGeometry = {
+  document: Document;
+  text: string;
+  font: string;
+  offsets: number[];
 };
 
 export abstract class ITextBehavior<
@@ -72,6 +80,7 @@ export abstract class ITextBehavior<
    */
   declare protected selected: boolean;
   declare protected cursorOffsetCache: { left?: number; top?: number };
+  private __rtlLineCursorGeometry?: Map<number, RtlLineCursorGeometry>;
   declare protected _savedProps?: {
     hasControls: boolean;
     borderColor: string;
@@ -97,6 +106,149 @@ export abstract class ITextBehavior<
     leftOffset: number;
     topOffset: number;
   };
+
+  override _clearCache() {
+    super._clearCache();
+    this.__rtlLineCursorGeometry?.clear();
+  }
+
+  /**
+   * Returns logical cursor offsets measured from the visual right edge of an
+   * unstyled RTL line.
+   *
+   * Fabric renders these lines as a single text run, so measuring graphemes
+   * individually (or in pairs) can disagree with the browser's contextual
+   * shaping. A collapsed DOM Range keeps the complete run intact while asking
+   * the browser for each insertion position.
+   *
+   * Unsupported layouts fall back to Fabric's regular char bounds.
+   */
+  protected _getRtlCursorOffsets(
+    lineIndex: number,
+  ): readonly number[] | undefined {
+    if (
+      this.direction !== RTL ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes(JUSTIFY) ||
+      !this.isEmptyStyles(lineIndex)
+    ) {
+      return;
+    }
+
+    const line = this._textLines[lineIndex];
+    if (!line?.length) {
+      return [0];
+    }
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      (this.canvas && getDocumentFromElement(this.canvas.getElement())) ||
+      getFabricDocument();
+    const body = doc.body;
+    if (!body || typeof doc.createRange !== 'function') {
+      return;
+    }
+
+    const text = line.join('');
+    const font = this._getFontDeclaration(
+      this.getCompleteStyleDeclaration(lineIndex, 0),
+    );
+    const cached = this.__rtlLineCursorGeometry?.get(lineIndex);
+    if (
+      cached &&
+      cached.document === doc &&
+      cached.text === text &&
+      cached.font === font
+    ) {
+      return cached.offsets;
+    }
+
+    const span = doc.createElement('span');
+    span.dir = RTL;
+    span.style.cssText = [
+      'all: initial',
+      'position: fixed',
+      'left: -100000px',
+      'top: 0',
+      'display: inline-block',
+      'margin: 0',
+      'padding: 0',
+      'border: 0',
+      'white-space: pre',
+      'direction: rtl',
+      'unicode-bidi: isolate',
+      'opacity: 0',
+      'pointer-events: none',
+    ].join(';');
+    span.style.font = font;
+    span.textContent = text;
+    body.appendChild(span);
+
+    try {
+      const node = span.firstChild;
+      if (!node) {
+        return;
+      }
+
+      const lineRect = span.getBoundingClientRect();
+      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
+        return;
+      }
+
+      const range = doc.createRange();
+      if (typeof range.getBoundingClientRect !== 'function') {
+        return;
+      }
+
+      const offsets = new Array<number>(line.length + 1);
+      offsets[0] = 0;
+      offsets[line.length] = lineRect.width;
+
+      let utf16Offset = 0;
+      for (let i = 1; i < line.length; i++) {
+        utf16Offset += line[i - 1].length;
+        range.setStart(node, utf16Offset);
+        range.collapse(true);
+
+        const rect = range.getBoundingClientRect();
+        const offset = lineRect.right - rect.left;
+        if (
+          !Number.isFinite(offset) ||
+          offset < -0.5 ||
+          offset > lineRect.width + 0.5
+        ) {
+          return;
+        }
+        offsets[i] = Math.max(0, Math.min(lineRect.width, offset));
+      }
+
+      // The existing IText geometry expects logical RTL advances to be
+      // monotonic. Mixed-direction runs can violate that assumption; keep the
+      // established Fabric behavior for those until BiDi affinity is modeled.
+      for (let i = 1; i < offsets.length; i++) {
+        if (offsets[i] + 0.5 < offsets[i - 1]) {
+          return;
+        }
+        offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+      }
+
+      // Do not retain measurements while fonts are still loading. Once the
+      // FontFaceSet settles, the next request will measure the final glyphs.
+      if (!doc.fonts || doc.fonts.status !== 'loading') {
+        (this.__rtlLineCursorGeometry ??= new Map()).set(lineIndex, {
+          document: doc,
+          text,
+          font,
+          offsets,
+        });
+      }
+
+      return offsets;
+    } finally {
+      span.remove();
+    }
+  }
 
   /**
    * Initializes all the interactive behavior of IText
