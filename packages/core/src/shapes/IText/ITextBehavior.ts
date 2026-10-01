@@ -39,7 +39,7 @@ export type ITextEvents = ObjectEvents & {
 type RtlLineCursorGeometry = {
   document: Document;
   text: string;
-  font: string;
+  signature: string;
   offsets: number[];
 };
 
@@ -113,15 +113,13 @@ export abstract class ITextBehavior<
   }
 
   /**
-   * Returns logical cursor offsets measured from the visual right edge of an
-   * unstyled RTL line.
+   * Returns logical cursor offsets measured from the visual right edge of the
+   * same contextual RTL runs used by Fabric's renderer.
    *
-   * Fabric renders these lines as a single text run, so measuring graphemes
-   * individually (or in pairs) can disagree with the browser's contextual
-   * shaping. A collapsed DOM Range keeps the complete run intact while asking
-   * the browser for each insertion position.
-   *
-   * Unsupported layouts fall back to Fabric's regular char bounds.
+   * Caret positions are deliberately kept separate from __charBounds. The
+   * latter stores legacy grapheme-box data used by several rendering/layout
+   * paths, while complex-script insertion boundaries are properties of the
+   * fully shaped run.
    */
   protected _getRtlCursorOffsets(
     lineIndex: number,
@@ -130,8 +128,7 @@ export abstract class ITextBehavior<
       this.direction !== RTL ||
       this.path ||
       this.charSpacing !== 0 ||
-      this.textAlign.includes(JUSTIFY) ||
-      !this.isEmptyStyles(lineIndex)
+      this.textAlign.includes(JUSTIFY)
     ) {
       return;
     }
@@ -139,6 +136,11 @@ export abstract class ITextBehavior<
     const line = this._textLines[lineIndex];
     if (!line?.length) {
       return [0];
+    }
+
+    const runs = this._getContextualRtlRuns(lineIndex, line);
+    if (!runs) {
+      return;
     }
 
     const doc =
@@ -151,18 +153,26 @@ export abstract class ITextBehavior<
     }
 
     const text = line.join('');
-    const font = this._getFontDeclaration(
-      this.getCompleteStyleDeclaration(lineIndex, 0),
-    );
+    const signature = runs
+      .map(
+        ({ start, end, width, style }) =>
+          `${start}:${end}:${width}:${this._getFontDeclaration(style)}`,
+      )
+      .join('|');
+
     const cached = this.__rtlLineCursorGeometry?.get(lineIndex);
     if (
       cached &&
       cached.document === doc &&
       cached.text === text &&
-      cached.font === font
+      cached.signature === signature
     ) {
       return cached.offsets;
     }
+
+    const offsets = new Array<number>(line.length + 1);
+    offsets[0] = 0;
+    let accumulatedWidth = 0;
 
     const span = doc.createElement('span');
     span.dir = RTL;
@@ -181,65 +191,88 @@ export abstract class ITextBehavior<
       'opacity: 0',
       'pointer-events: none',
     ].join(';');
-    span.style.font = font;
-    span.textContent = text;
     body.appendChild(span);
 
     try {
-      const node = span.firstChild;
-      if (!node) {
-        return;
-      }
+      for (const run of runs) {
+        span.style.font = this._getFontDeclaration(run.style);
+        span.textContent = run.text;
 
-      const lineRect = span.getBoundingClientRect();
-      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
-        return;
-      }
-
-      const range = doc.createRange();
-      if (typeof range.getBoundingClientRect !== 'function') {
-        return;
-      }
-
-      const offsets = new Array<number>(line.length + 1);
-      offsets[0] = 0;
-      offsets[line.length] = lineRect.width;
-
-      let utf16Offset = 0;
-      for (let i = 1; i < line.length; i++) {
-        utf16Offset += line[i - 1].length;
-        range.setStart(node, utf16Offset);
-        range.collapse(true);
-
-        const rect = range.getBoundingClientRect();
-        const offset = lineRect.right - rect.left;
-        if (
-          !Number.isFinite(offset) ||
-          offset < -0.5 ||
-          offset > lineRect.width + 0.5
-        ) {
+        const node = span.firstChild;
+        if (!node) {
           return;
         }
-        offsets[i] = Math.max(0, Math.min(lineRect.width, offset));
-      }
 
-      // The existing IText geometry expects logical RTL advances to be
-      // monotonic. Mixed-direction runs can violate that assumption; keep the
-      // established Fabric behavior for those until BiDi affinity is modeled.
-      for (let i = 1; i < offsets.length; i++) {
-        if (offsets[i] + 0.5 < offsets[i - 1]) {
+        const runRect = span.getBoundingClientRect();
+        if (!Number.isFinite(runRect.width) || runRect.width <= 0) {
           return;
         }
-        offsets[i] = Math.max(offsets[i], offsets[i - 1]);
+
+        const range = doc.createRange();
+        if (typeof range.getBoundingClientRect !== 'function') {
+          return;
+        }
+
+        const runLength = run.end - run.start;
+        const runOffsets = new Array<number>(runLength + 1);
+        runOffsets[0] = 0;
+        runOffsets[runLength] = runRect.width;
+
+        let utf16Offset = 0;
+        for (let i = 1; i < runLength; i++) {
+          utf16Offset += line[run.start + i - 1].length;
+          range.setStart(node, utf16Offset);
+          range.collapse(true);
+
+          const rect = range.getBoundingClientRect();
+          const offset = runRect.right - rect.left;
+          if (
+            !Number.isFinite(offset) ||
+            offset < -0.5 ||
+            offset > runRect.width + 0.5
+          ) {
+            return;
+          }
+          runOffsets[i] = Math.max(
+            0,
+            Math.min(runRect.width, offset),
+          );
+        }
+
+        // The current IText selection model expects logical RTL advances to
+        // stay monotonic. Mixed-direction affinity needs a richer model, so
+        // preserve Fabric's fallback for such runs for now.
+        for (let i = 1; i < runOffsets.length; i++) {
+          if (runOffsets[i] + 0.5 < runOffsets[i - 1]) {
+            return;
+          }
+          runOffsets[i] = Math.max(
+            runOffsets[i],
+            runOffsets[i - 1],
+          );
+        }
+
+        // DOM Range provides the internal caret locations, while Canvas owns
+        // the actual rendered run width. Normalize the DOM positions to the
+        // canvas width so editing and rendering share one coordinate system.
+        const scale = run.width / runRect.width;
+        for (let i = 0; i < runOffsets.length; i++) {
+          runOffsets[i] *= scale;
+        }
+
+        for (let i = 0; i < runLength; i++) {
+          offsets[run.start + i] =
+            accumulatedWidth + runOffsets[i];
+        }
+        accumulatedWidth += run.width;
+        offsets[run.end] = accumulatedWidth;
       }
 
-      // Do not retain measurements while fonts are still loading. Once the
-      // FontFaceSet settles, the next request will measure the final glyphs.
       if (!doc.fonts || doc.fonts.status !== 'loading') {
         (this.__rtlLineCursorGeometry ??= new Map()).set(lineIndex, {
           document: doc,
           text,
-          font,
+          signature,
           offsets,
         });
       }
