@@ -327,8 +327,43 @@
     );
   };
 
+
+  // Preserve sparse styles when a selection is moved inside the same IText.
+  // Fabric's drag payload intentionally stores complete styles for cross-object
+  // drops, but reusing those complete declarations on the same object turns
+  // defaults into per-character styles and breaks contextual shaping.
+  const probe = new fabric.IText('');
+  const dragDelegateProto = Object.getPrototypeOf(probe.draggableTextDelegate);
+  probe.dispose();
+
+  const originalDropHandler = dragDelegateProto.dropHandler;
+  dragDelegateProto.dropHandler = function (ev) {
+    const selection = this.__dragStartSelection;
+    if (!selection) {
+      return originalDropHandler.call(this, ev);
+    }
+
+    const target = this.target;
+    const sparseStyles = target
+      .getSelectionStyles(selection.selectionStart, selection.selectionEnd)
+      .map((style) => ({ ...style }));
+    const originalInsertChars = target.insertChars;
+
+    target.insertChars = function (text, _styles, start, end) {
+      return originalInsertChars.call(this, text, sparseStyles, start, end);
+    };
+
+    try {
+      return originalDropHandler.call(this, ev);
+    } finally {
+      target.insertChars = originalInsertChars;
+    }
+  };
+
+
   window.__fabricRtlContextualGeometryPatch = {
-    commit: '776fea19d2a61f1f81d6b433b20cf3485625de12',
+    commit: 'f5e6a2ce15e40aea9ccca4526589cf06d15cbb4c',
     applied: true,
+    preservesSparseStylesOnInternalDrop: true,
   };
 })();
