@@ -26,10 +26,6 @@
   const sameRenderingStyle = (a, b) =>
     styleKeys.every((key) => a[key] === b[key]);
 
-  const reArabicRtlEditingLine =
-    /^(?:\p{Script_Extensions=Arabic}|\p{Mark}|\p{Separator}|\p{Punctuation}|\p{Symbol}|\s)*$/u;
-  const reNumber = /\p{Number}/u;
-
   const getCache = (target) => {
     let cache = geometryCache.get(target);
     if (!cache) {
@@ -39,19 +35,10 @@
     return cache;
   };
 
-  const measureRtlEditingBoundaries = (
-    doc,
-    line,
-    font,
-  ) => {
+  const createMeasurementSpan = (doc, line, font) => {
     const body = doc?.body;
     if (!body || typeof doc.createRange !== 'function') {
       return undefined;
-    }
-
-    const text = line.join('');
-    if (!text) {
-      return [0];
     }
 
     const span = doc.createElement('span');
@@ -76,42 +63,57 @@
       'letter-spacing: 0px',
     ].join(';');
     span.style.font = font;
-    span.textContent = text;
+    span.textContent = line.join('');
     body.appendChild(span);
 
+    const node = span.firstChild;
+    if (!node) {
+      span.remove();
+      return undefined;
+    }
+
+    const lineRect = span.getBoundingClientRect();
+    if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
+      span.remove();
+      return undefined;
+    }
+
+    const offsets = [0];
+    let codeUnitOffset = 0;
+    for (const grapheme of line) {
+      codeUnitOffset += grapheme.length;
+      offsets.push(codeUnitOffset);
+    }
+
+    return { span, node, lineRect, offsets };
+  };
+
+  const measureRtlEditingBoundaries = (
+    doc,
+    line,
+    font,
+  ) => {
+    const measurement = createMeasurementSpan(
+      doc,
+      line,
+      font,
+    );
+    if (!measurement) {
+      return undefined;
+    }
+
+    const { span, node, lineRect, offsets } =
+      measurement;
+
     try {
-      const node = span.firstChild;
-      if (!node) {
-        return undefined;
-      }
-
-      const lineRect = span.getBoundingClientRect();
-      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
-        return undefined;
-      }
-
       const range = doc.createRange();
       if (typeof range.getBoundingClientRect !== 'function') {
         return undefined;
       }
 
-      const codeUnitOffsets = [0];
-      let codeUnitOffset = 0;
-      for (const grapheme of line) {
-        codeUnitOffset += grapheme.length;
-        codeUnitOffsets.push(codeUnitOffset);
-      }
-
-      const boundaries = codeUnitOffsets.map((offset, index) => {
-        if (index === 0) {
-          return 0;
-        }
-        if (index === codeUnitOffsets.length - 1) {
-          return lineRect.width;
-        }
-
-        range.setStart(node, 0);
-        range.setEnd(node, offset);
+      const boundaries = offsets.map((offset) => {
+        range.setStart(node, offset);
+        range.collapse(true);
 
         const rect = range.getBoundingClientRect();
         const boundary = lineRect.right - rect.left;
@@ -122,20 +124,87 @@
         );
       });
 
-      for (let i = 1; i < boundaries.length; i++) {
-        if (
-          !Number.isFinite(boundaries[i]) ||
-          boundaries[i] + 0.5 < boundaries[i - 1]
-        ) {
-          return undefined;
-        }
-      }
-
-      return boundaries;
+      return boundaries.every(Number.isFinite)
+        ? boundaries
+        : undefined;
     } finally {
       span.remove();
     }
   };
+
+  const measureRtlSelectionRects = (
+    doc,
+    line,
+    font,
+    startChar,
+    endChar,
+  ) => {
+    if (startChar === endChar) {
+      return [];
+    }
+
+    const measurement = createMeasurementSpan(
+      doc,
+      line,
+      font,
+    );
+    if (!measurement) {
+      return undefined;
+    }
+
+    const { span, node, lineRect, offsets } =
+      measurement;
+
+    try {
+      const range = doc.createRange();
+      if (typeof range.getClientRects !== 'function') {
+        return undefined;
+      }
+
+      range.setStart(node, offsets[startChar]);
+      range.setEnd(node, offsets[endChar]);
+
+      return Array.from(range.getClientRects())
+        .filter(
+          (rect) =>
+            Number.isFinite(rect.left) &&
+            Number.isFinite(rect.right) &&
+            rect.width > 0,
+        )
+        .map((rect) => ({
+          leftBoundary:
+            lineRect.right - rect.left,
+          rightBoundary:
+            lineRect.right - rect.right,
+        }));
+    } finally {
+      span.remove();
+    }
+  };
+
+  const boundaryToLocalX = (
+    target,
+    lineIndex,
+    boundary,
+  ) => {
+    const lineLeftOffset =
+      target._getLineLeftOffset(lineIndex);
+
+    if (target.textAlign === 'right') {
+      return (
+        target._getLeftOffset() -
+        lineLeftOffset -
+        boundary
+      );
+    }
+
+    return (
+      target._getLeftOffset() +
+      lineLeftOffset -
+      boundary
+    );
+  };
+
 
   proto._getRtlEditingBoundaries = function (lineIndex) {
     if (
@@ -154,10 +223,6 @@
     }
 
     const text = line.join('');
-    if (reNumber.test(text) || !reArabicRtlEditingLine.test(text)) {
-      return undefined;
-    }
-
     const style = this.getCompleteStyleDeclaration(lineIndex, 0);
     for (let i = 1; i < line.length; i++) {
       if (
@@ -286,133 +351,157 @@
     selection,
     boundaries,
   ) {
-    if (this.direction === 'rtl') {
-      const selectionStart = Math.min(
-        selection.selectionStart,
-        selection.selectionEnd,
+    if (this.direction !== 'rtl') {
+      return originalSelection.call(
+        this,
+        ctx,
+        selection,
+        boundaries,
       );
-      const selectionEnd = Math.max(
-        selection.selectionStart,
-        selection.selectionEnd,
-      );
-
-      if (selectionStart !== selectionEnd) {
-        const start =
-          this.get2DCursorLocation(selectionStart);
-        const end =
-          this.get2DCursorLocation(selectionEnd);
-
-        let canUseShapedGeometry = true;
-
-        for (
-          let lineIndex = start.lineIndex;
-          lineIndex <= end.lineIndex;
-          lineIndex++
-        ) {
-          const line = this._textLines[lineIndex];
-          const startChar =
-            lineIndex === start.lineIndex
-              ? start.charIndex
-              : 0;
-          const endChar =
-            lineIndex === end.lineIndex
-              ? end.charIndex
-              : line.length;
-
-          if (
-            this._getRtlEditingCursorX(
-              lineIndex,
-              startChar,
-            ) === undefined ||
-            this._getRtlEditingCursorX(
-              lineIndex,
-              endChar,
-            ) === undefined
-          ) {
-            canUseShapedGeometry = false;
-            break;
-          }
-        }
-
-        if (canUseShapedGeometry) {
-          let lineTop = this._getTopOffset();
-
-          for (let i = 0; i < start.lineIndex; i++) {
-            lineTop += this.getHeightOfLine(i);
-          }
-
-          for (
-            let lineIndex = start.lineIndex;
-            lineIndex <= end.lineIndex;
-            lineIndex++
-          ) {
-            const line = this._textLines[lineIndex];
-            const startChar =
-              lineIndex === start.lineIndex
-                ? start.charIndex
-                : 0;
-            const endChar =
-              lineIndex === end.lineIndex
-                ? end.charIndex
-                : line.length;
-
-            const startX =
-              this._getRtlEditingCursorX(
-                lineIndex,
-                startChar,
-              );
-            const endX =
-              this._getRtlEditingCursorX(
-                lineIndex,
-                endChar,
-              );
-
-            let lineHeight =
-              this.getHeightOfLine(lineIndex);
-            const realLineHeight = lineHeight;
-            let drawHeight = lineHeight;
-            let extraTop = 0;
-
-            if (
-              this.lineHeight < 1 ||
-              (lineIndex === end.lineIndex &&
-                this.lineHeight > 1)
-            ) {
-              lineHeight /= this.lineHeight;
-              drawHeight = lineHeight;
-            }
-
-            if (this.inCompositionMode) {
-              ctx.fillStyle =
-                this.compositionColor || 'black';
-              drawHeight = 1;
-              extraTop = lineHeight;
-            } else {
-              ctx.fillStyle = this.selectionColor;
-            }
-
-            ctx.fillRect(
-              Math.min(startX, endX),
-              lineTop + extraTop,
-              Math.abs(endX - startX),
-              drawHeight,
-            );
-
-            lineTop += realLineHeight;
-          }
-
-          return;
-        }
-      }
     }
 
-    return originalSelection.call(
-      this,
-      ctx,
-      selection,
-      boundaries,
+    const selectionStart = Math.min(
+      selection.selectionStart,
+      selection.selectionEnd,
     );
+    const selectionEnd = Math.max(
+      selection.selectionStart,
+      selection.selectionEnd,
+    );
+
+    if (selectionStart === selectionEnd) {
+      return originalSelection.call(
+        this,
+        ctx,
+        selection,
+        boundaries,
+      );
+    }
+
+    const start =
+      this.get2DCursorLocation(selectionStart);
+    const end =
+      this.get2DCursorLocation(selectionEnd);
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      this.canvas?.getElement?.()?.ownerDocument ||
+      document;
+
+    const lineSelections = [];
+
+    for (
+      let lineIndex = start.lineIndex;
+      lineIndex <= end.lineIndex;
+      lineIndex++
+    ) {
+      const line = this._textLines[lineIndex];
+      const startChar =
+        lineIndex === start.lineIndex
+          ? start.charIndex
+          : 0;
+      const endChar =
+        lineIndex === end.lineIndex
+          ? end.charIndex
+          : line.length;
+
+      if (
+        this._getRtlEditingBoundaries(lineIndex) ===
+        undefined
+      ) {
+        return originalSelection.call(
+          this,
+          ctx,
+          selection,
+          boundaries,
+        );
+      }
+
+      const style =
+        this.getCompleteStyleDeclaration(
+          lineIndex,
+          0,
+        );
+      const font =
+        this._getFontDeclaration(style);
+      const rects = measureRtlSelectionRects(
+        doc,
+        line,
+        font,
+        startChar,
+        endChar,
+      );
+
+      if (rects === undefined) {
+        return originalSelection.call(
+          this,
+          ctx,
+          selection,
+          boundaries,
+        );
+      }
+
+      lineSelections.push({
+        lineIndex,
+        rects,
+      });
+    }
+
+    let lineTop = this._getTopOffset();
+
+    for (let i = 0; i < start.lineIndex; i++) {
+      lineTop += this.getHeightOfLine(i);
+    }
+
+    for (const { lineIndex, rects } of lineSelections) {
+      let lineHeight =
+        this.getHeightOfLine(lineIndex);
+      const realLineHeight = lineHeight;
+
+      if (
+        this.lineHeight < 1 ||
+        (lineIndex === end.lineIndex &&
+          this.lineHeight > 1)
+      ) {
+        lineHeight /= this.lineHeight;
+      }
+
+      let drawHeight = lineHeight;
+      let extraTop = 0;
+
+      if (this.inCompositionMode) {
+        ctx.fillStyle =
+          this.compositionColor || 'black';
+        drawHeight = 1;
+        extraTop = lineHeight;
+      } else {
+        ctx.fillStyle = this.selectionColor;
+      }
+
+      for (const rect of rects) {
+        const x1 = boundaryToLocalX(
+          this,
+          lineIndex,
+          rect.leftBoundary,
+        );
+        const x2 = boundaryToLocalX(
+          this,
+          lineIndex,
+          rect.rightBoundary,
+        );
+
+        ctx.fillRect(
+          Math.min(x1, x2),
+          lineTop + extraTop,
+          Math.abs(x2 - x1),
+          drawHeight,
+        );
+      }
+
+      lineTop += realLineHeight;
+    }
   };
+
 
   proto.getSelectionStartFromPointer = function (e) {
     const mouseOffset = this.canvas
@@ -524,14 +613,17 @@
 
   window.__fabricRtlEditingGeometryCleanPatch = {
     commit:
-      'aabbdf8bf49166a8a50953d4f3a4f43e09643c5c',
+      'EXPERIMENTAL-MIXED-BIDI-COLLAPSED-RANGE',
     applied: true,
-    usesPrefixRanges: true,
+    usesPrefixRanges: false,
+    usesCollapsedCaretRanges: true,
+    usesVisualSelectionRects: true,
     modifiesRenderer: false,
     modifiesCharBounds: false,
     modifiesDragDrop: false,
     isolatesDomMeasurement: true,
-    mixedDirectionFallback: true,
+    mixedDirectionFallback: false,
+    experimentalMixedBidi: true,
     flipXFallback: true,
   };
 })();
