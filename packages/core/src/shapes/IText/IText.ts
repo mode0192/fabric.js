@@ -506,6 +506,20 @@ export class IText<
     for (let i = 0; i < lineIndex; i++) {
       topOffset += this.getHeightOfLine(i);
     }
+
+    if (direction === RTL) {
+      const shapedLeftOffset = this._getRtlEditingCursorLeftOffset(
+        lineIndex,
+        charIndex,
+      );
+      if (shapedLeftOffset !== undefined) {
+        return {
+          top: topOffset,
+          left: shapedLeftOffset,
+        };
+      }
+    }
+
     const lineLeftOffset = this._getLineLeftOffset(lineIndex);
     const bound = this.__charBounds[lineIndex][charIndex];
     bound && (leftOffset = bound.left);
@@ -657,6 +671,102 @@ export class IText<
     selection: { selectionStart: number; selectionEnd: number },
     boundaries: CursorBoundaries,
   ) {
+    if (this.direction === RTL) {
+      const selectionStart = Math.min(
+        selection.selectionStart,
+        selection.selectionEnd,
+      );
+      const selectionEnd = Math.max(
+        selection.selectionStart,
+        selection.selectionEnd,
+      );
+
+      if (selectionStart !== selectionEnd) {
+        const start = this.get2DCursorLocation(selectionStart);
+        const end = this.get2DCursorLocation(selectionEnd);
+
+        let canUseShapedGeometry = true;
+        for (
+          let lineIndex = start.lineIndex;
+          lineIndex <= end.lineIndex;
+          lineIndex++
+        ) {
+          const line = this._textLines[lineIndex];
+          const startChar =
+            lineIndex === start.lineIndex ? start.charIndex : 0;
+          const endChar =
+            lineIndex === end.lineIndex ? end.charIndex : line.length;
+
+          if (
+            this._getRtlEditingCursorX(lineIndex, startChar) === undefined ||
+            this._getRtlEditingCursorX(lineIndex, endChar) === undefined
+          ) {
+            canUseShapedGeometry = false;
+            break;
+          }
+        }
+
+        if (canUseShapedGeometry) {
+          let lineTop = this._getTopOffset();
+          for (let i = 0; i < start.lineIndex; i++) {
+            lineTop += this.getHeightOfLine(i);
+          }
+
+          for (
+            let lineIndex = start.lineIndex;
+            lineIndex <= end.lineIndex;
+            lineIndex++
+          ) {
+            const line = this._textLines[lineIndex];
+            const startChar =
+              lineIndex === start.lineIndex ? start.charIndex : 0;
+            const endChar =
+              lineIndex === end.lineIndex ? end.charIndex : line.length;
+
+            const startX = this._getRtlEditingCursorX(
+              lineIndex,
+              startChar,
+            )!;
+            const endX = this._getRtlEditingCursorX(
+              lineIndex,
+              endChar,
+            )!;
+
+            let lineHeight = this.getHeightOfLine(lineIndex);
+            const realLineHeight = lineHeight;
+            let drawHeight = lineHeight;
+            let extraTop = 0;
+
+            if (
+              this.lineHeight < 1 ||
+              (lineIndex === end.lineIndex && this.lineHeight > 1)
+            ) {
+              lineHeight /= this.lineHeight;
+              drawHeight = lineHeight;
+            }
+
+            if (this.inCompositionMode) {
+              ctx.fillStyle = this.compositionColor || 'black';
+              drawHeight = 1;
+              extraTop = lineHeight;
+            } else {
+              ctx.fillStyle = this.selectionColor;
+            }
+
+            ctx.fillRect(
+              Math.min(startX, endX),
+              lineTop + extraTop,
+              Math.abs(endX - startX),
+              drawHeight,
+            );
+
+            lineTop += realLineHeight;
+          }
+          return;
+        }
+      }
+    }
+
     const { textAlign, direction } = this;
     const selectionStart = selection.selectionStart,
       selectionEnd = selection.selectionEnd,
