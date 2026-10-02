@@ -9,7 +9,9 @@ import type { TextStyleDeclaration } from '../Text/StyledText';
 import type { SerializedTextProps, TextProps } from '../Text/Text';
 import type { TOptions, TOriginX } from '../../typedefs';
 import { getDocumentFromElement } from '../../util/dom_misc';
-import { LEFT, LTR, MODIFIED, RIGHT, reNewline } from '../../constants';
+import { getFabricDocument } from '../../env';
+import { hasStyleChanged } from '../../util/misc/textStyles';
+import { LEFT, LTR, MODIFIED, RIGHT, RTL, reNewline } from '../../constants';
 import type { IText } from './IText';
 import { JUSTIFY } from '../Text/constants';
 
@@ -33,6 +35,12 @@ export type ITextEvents = ObjectEvents & {
   changed: never | { index: number; action: string };
   'editing:entered': never | { e: TPointerEvent };
   'editing:exited': never;
+};
+
+type RtlEditingGeometry = {
+  document: Document;
+  signature: string;
+  boundaries: number[];
 };
 
 export abstract class ITextBehavior<
@@ -72,6 +80,7 @@ export abstract class ITextBehavior<
    */
   declare protected selected: boolean;
   declare protected cursorOffsetCache: { left?: number; top?: number };
+  private __rtlEditingGeometry?: Map<number, RtlEditingGeometry>;
   declare protected _savedProps?: {
     hasControls: boolean;
     borderColor: string;
@@ -97,6 +106,206 @@ export abstract class ITextBehavior<
     leftOffset: number;
     topOffset: number;
   };
+
+  override _clearCache() {
+    super._clearCache();
+    this.__rtlEditingGeometry?.clear();
+  }
+
+  /**
+   * Returns insertion boundaries for a uniformly rendered RTL line.
+   *
+   * Fabric's __charBounds are based on grapheme/pair measurements, while an
+   * unbroken Arabic run is shaped contextually as a whole. Measure logical
+   * prefixes without changing the text node so every boundary comes from the
+   * browser-shaped full line.
+   *
+   * Explicit per-character styles do not disable this path when their effective
+   * rendering style is unchanged. This is important after editing operations
+   * that may materialize inherited styles.
+   */
+  protected _getRtlEditingBoundaries(
+    lineIndex: number,
+  ): readonly number[] | undefined {
+    if (
+      this.direction !== RTL ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes(JUSTIFY)
+    ) {
+      return;
+    }
+
+    const line = this._textLines[lineIndex];
+    if (!line?.length) {
+      return [0];
+    }
+
+    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
+    for (let i = 1; i < line.length; i++) {
+      if (
+        hasStyleChanged(
+          style,
+          this.getCompleteStyleDeclaration(lineIndex, i),
+          false,
+        )
+      ) {
+        return;
+      }
+    }
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      (this.canvas && getDocumentFromElement(this.canvas.getElement())) ||
+      getFabricDocument();
+    const body = doc.body;
+    if (!body || typeof doc.createRange !== 'function') {
+      return;
+    }
+
+    const text = line.join('');
+    const font = this._getFontDeclaration(style);
+    const signature = `${text}\u0000${font}\u0000${this.direction}`;
+    const cached = this.__rtlEditingGeometry?.get(lineIndex);
+
+    if (
+      cached &&
+      cached.document === doc &&
+      cached.signature === signature
+    ) {
+      return cached.boundaries;
+    }
+
+    const span = doc.createElement('span');
+    span.dir = RTL;
+    span.style.cssText = [
+      'all: initial',
+      'position: fixed',
+      'left: -100000px',
+      'top: 0',
+      'display: inline-block',
+      'margin: 0',
+      'padding: 0',
+      'border: 0',
+      'white-space: pre',
+      'direction: rtl',
+      'unicode-bidi: isolate',
+      'opacity: 0',
+      'pointer-events: none',
+      'font-kerning: normal',
+      'font-variant-ligatures: normal',
+      'letter-spacing: 0px',
+    ].join(';');
+    span.style.font = font;
+    span.textContent = text;
+    body.appendChild(span);
+
+    try {
+      const node = span.firstChild;
+      if (!node) {
+        return;
+      }
+
+      const lineRect = span.getBoundingClientRect();
+      if (!Number.isFinite(lineRect.width) || lineRect.width <= 0) {
+        return;
+      }
+
+      const range = doc.createRange();
+      if (typeof range.getBoundingClientRect !== 'function') {
+        return;
+      }
+
+      const codeUnitOffsets = [0];
+      let codeUnitOffset = 0;
+      for (const grapheme of line) {
+        codeUnitOffset += grapheme.length;
+        codeUnitOffsets.push(codeUnitOffset);
+      }
+
+      const boundaries = codeUnitOffsets.map((offset, index) => {
+        if (index === 0) {
+          return 0;
+        }
+        if (index === codeUnitOffsets.length - 1) {
+          return lineRect.width;
+        }
+
+        // Keep the complete Arabic text node intact. Selecting a logical
+        // prefix lets the browser preserve contextual shaping while exposing
+        // the visual insertion boundary after that grapheme.
+        range.setStart(node, 0);
+        range.setEnd(node, offset);
+        const rect = range.getBoundingClientRect();
+        const boundary = lineRect.right - rect.left;
+
+        return Math.max(
+          0,
+          Math.min(lineRect.width, boundary),
+        );
+      });
+
+      for (let i = 1; i < boundaries.length; i++) {
+        if (
+          !Number.isFinite(boundaries[i]) ||
+          boundaries[i] + 0.5 < boundaries[i - 1]
+        ) {
+          return;
+        }
+      }
+
+      if (!doc.fonts || doc.fonts.status !== 'loading') {
+        (this.__rtlEditingGeometry ??= new Map()).set(lineIndex, {
+          document: doc,
+          signature,
+          boundaries,
+        });
+      }
+
+      return boundaries;
+    } finally {
+      span.remove();
+    }
+  }
+
+  /**
+   * Converts a shaped RTL boundary into Fabric's cursor leftOffset coordinate.
+   */
+  protected _getRtlEditingCursorLeftOffset(
+    lineIndex: number,
+    charIndex: number,
+  ): number | undefined {
+    const boundary =
+      this._getRtlEditingBoundaries(lineIndex)?.[charIndex];
+    if (boundary === undefined) {
+      return;
+    }
+
+    const lineLeftOffset = this._getLineLeftOffset(lineIndex);
+
+    if (
+      this.textAlign === RIGHT ||
+      this.textAlign === JUSTIFY ||
+      this.textAlign === 'justify-right'
+    ) {
+      return -(lineLeftOffset + boundary);
+    }
+
+    return lineLeftOffset - boundary;
+  }
+
+  protected _getRtlEditingCursorX(
+    lineIndex: number,
+    charIndex: number,
+  ): number | undefined {
+    const leftOffset = this._getRtlEditingCursorLeftOffset(
+      lineIndex,
+      charIndex,
+    );
+    return leftOffset === undefined
+      ? undefined
+      : this._getLeftOffset() + leftOffset;
+  }
 
   /**
    * Initializes all the interactive behavior of IText
