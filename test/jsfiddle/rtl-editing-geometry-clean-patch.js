@@ -519,7 +519,7 @@
 
   window.__fabricRtlEditingGeometryCleanPatch = {
     commit:
-      '666b49a426c1dd811d961e2903ce0c7ce5b8edb3',
+      '9480bba19caabd470e3abd00ef01d64139199a1f',
     applied: true,
     usesPrefixRanges: true,
     modifiesRenderer: false,
