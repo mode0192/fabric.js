@@ -524,12 +524,14 @@
 
   window.__fabricRtlEditingGeometryCleanPatch = {
     commit:
-      '9480bba19caabd470e3abd00ef01d64139199a1f',
+      'aabbdf8bf49166a8a50953d4f3a4f43e09643c5c',
     applied: true,
     usesPrefixRanges: true,
     modifiesRenderer: false,
     modifiesCharBounds: false,
     modifiesDragDrop: false,
     isolatesDomMeasurement: true,
+    mixedDirectionFallback: true,
+    flipXFallback: true,
   };
 })();
