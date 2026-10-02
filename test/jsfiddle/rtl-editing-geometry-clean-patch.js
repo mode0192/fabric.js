@@ -132,6 +132,115 @@
     }
   };
 
+  const measureRtlHitCandidates = (
+    doc,
+    line,
+    font,
+    primaryBoundaries,
+  ) => {
+    const measurement = createMeasurementSpan(
+      doc,
+      line,
+      font,
+    );
+    if (!measurement) {
+      return undefined;
+    }
+
+    const { span, node, lineRect, offsets } =
+      measurement;
+
+    try {
+      const range = doc.createRange();
+      if (typeof range.getClientRects !== 'function') {
+        return undefined;
+      }
+
+      const candidates = Array.from(
+        { length: offsets.length },
+        () => [],
+      );
+
+      const addCandidate = (index, boundary) => {
+        if (!Number.isFinite(boundary)) {
+          return;
+        }
+
+        const values = candidates[index];
+        if (
+          !values.some(
+            (value) =>
+              Math.abs(value - boundary) < 0.5,
+          )
+        ) {
+          values.push(boundary);
+        }
+      };
+
+      primaryBoundaries.forEach((boundary, index) => {
+        addCandidate(index, boundary);
+      });
+
+      for (let i = 0; i < line.length; i++) {
+        range.setStart(node, offsets[i]);
+        range.setEnd(node, offsets[i + 1]);
+
+        const rects = Array.from(
+          range.getClientRects(),
+        ).filter(
+          (rect) =>
+            Number.isFinite(rect.left) &&
+            Number.isFinite(rect.right) &&
+            rect.width > 0,
+        );
+
+        if (rects.length !== 1) {
+          continue;
+        }
+
+        const rect = rects[0];
+        const leftEdge =
+          lineRect.right - rect.left;
+        const rightEdge =
+          lineRect.right - rect.right;
+        const startPrimary =
+          primaryBoundaries[i];
+        const endPrimary =
+          primaryBoundaries[i + 1];
+
+        const costStartLeft =
+          Math.abs(startPrimary - leftEdge);
+        const costStartRight =
+          Math.abs(startPrimary - rightEdge);
+        const costEndLeft =
+          Math.abs(endPrimary - leftEdge);
+        const costEndRight =
+          Math.abs(endPrimary - rightEdge);
+
+        // A grapheme's logical start/end must be its two visual
+        // edges. At a bidi run boundary a collapsed DOM caret may
+        // expose only the primary side, so infer the secondary side
+        // from the opposite edge of the grapheme box.
+        const normalCost =
+          costStartLeft + costEndRight;
+        const reversedCost =
+          costStartRight + costEndLeft;
+
+        if (normalCost <= reversedCost) {
+          addCandidate(i, leftEdge);
+          addCandidate(i + 1, rightEdge);
+        } else {
+          addCandidate(i, rightEdge);
+          addCandidate(i + 1, leftEdge);
+        }
+      }
+
+      return candidates;
+    } finally {
+      span.remove();
+    }
+  };
+
   const measureRtlSelectionRects = (
     doc,
     line,
@@ -271,6 +380,62 @@
     }
 
     return boundaries;
+  };
+
+  proto._getRtlEditingHitCandidates = function (
+    lineIndex,
+  ) {
+    if (
+      this.direction !== 'rtl' ||
+      this.flipX ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes('justify')
+    ) {
+      return undefined;
+    }
+
+    const line = this._textLines[lineIndex];
+    if (!line?.length) {
+      return [[0]];
+    }
+
+    const primaryBoundaries =
+      this._getRtlEditingBoundaries(lineIndex);
+    if (!primaryBoundaries) {
+      return undefined;
+    }
+
+    const style =
+      this.getCompleteStyleDeclaration(
+        lineIndex,
+        0,
+      );
+    for (let i = 1; i < line.length; i++) {
+      if (
+        !sameRenderingStyle(
+          style,
+          this.getCompleteStyleDeclaration(
+            lineIndex,
+            i,
+          ),
+        )
+      ) {
+        return undefined;
+      }
+    }
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      this.canvas?.getElement?.()?.ownerDocument ||
+      document;
+
+    return measureRtlHitCandidates(
+      doc,
+      line,
+      this._getFontDeclaration(style),
+      primaryBoundaries,
+    );
   };
 
   proto._getRtlEditingCursorLeftOffset = function (
@@ -547,31 +712,35 @@
       : mouseOffset.x;
 
     if (isRtl) {
-      const boundaries =
-        this._getRtlEditingBoundaries(lineIndex);
+      const candidates =
+        this._getRtlEditingHitCandidates(
+          lineIndex,
+        );
 
-      if (boundaries) {
+      if (candidates) {
         let localIndex = 0;
         let nearestDistance =
           Number.POSITIVE_INFINITY;
 
-        for (let i = 0; i <= charLength; i++) {
-          const distance = Math.abs(
-            effectiveX - boundaries[i],
-          );
+        for (
+          let i = 0;
+          i < candidates.length;
+          i++
+        ) {
+          for (const boundary of candidates[i]) {
+            const distance = Math.abs(
+              effectiveX - boundary,
+            );
 
-          if (distance < nearestDistance) {
-            nearestDistance = distance;
-            localIndex = i;
+            if (distance < nearestDistance) {
+              nearestDistance = distance;
+              localIndex = i;
+            }
           }
         }
 
-        const resolvedLocalIndex = this.flipX
-          ? charLength - localIndex
-          : localIndex;
-
         return Math.min(
-          lineStart + resolvedLocalIndex,
+          lineStart + localIndex,
           this._text.length,
         );
       }
@@ -618,6 +787,7 @@
     usesPrefixRanges: false,
     usesCollapsedCaretRanges: true,
     usesVisualSelectionRects: true,
+    usesSplitBidiHitCandidates: true,
     modifiesRenderer: false,
     modifiesCharBounds: false,
     modifiesDragDrop: false,
