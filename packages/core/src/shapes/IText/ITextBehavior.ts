@@ -9,9 +9,12 @@ import type { TextStyleDeclaration } from '../Text/StyledText';
 import type { SerializedTextProps, TextProps } from '../Text/Text';
 import type { TOptions, TOriginX } from '../../typedefs';
 import { getDocumentFromElement } from '../../util/dom_misc';
-import { LEFT, LTR, MODIFIED, RIGHT, reNewline } from '../../constants';
+import { getFabricDocument } from '../../env';
+import { hasStyleChanged } from '../../util/misc/textStyles';
+import { LEFT, LTR, MODIFIED, RIGHT, RTL, reNewline } from '../../constants';
 import type { IText } from './IText';
 import { JUSTIFY } from '../Text/constants';
+import { measureRtlEditingBoundaries } from './measureRtlEditingBoundaries';
 
 /**
  *  extend this regex to support non english languages
@@ -28,11 +31,21 @@ import { JUSTIFY } from '../Text/constants';
 // eslint-disable-next-line no-useless-escape
 const reNonWord = /[ \n\.,;!\?\-]/;
 
+const reArabicRtlEditingLine =
+  /^(?:\p{Script_Extensions=Arabic}|\p{Mark}|\p{Separator}|\p{Punctuation}|\p{Symbol}|\s)*$/u;
+const reNumber = /\p{Number}/u;
+
 export type ITextEvents = ObjectEvents & {
   'selection:changed': never;
   changed: never | { index: number; action: string };
   'editing:entered': never | { e: TPointerEvent };
   'editing:exited': never;
+};
+
+type RtlEditingGeometry = {
+  document: Document;
+  signature: string;
+  boundaries: number[];
 };
 
 export abstract class ITextBehavior<
@@ -72,6 +85,7 @@ export abstract class ITextBehavior<
    */
   declare protected selected: boolean;
   declare protected cursorOffsetCache: { left?: number; top?: number };
+  declare private __rtlEditingGeometry?: Map<number, RtlEditingGeometry>;
   declare protected _savedProps?: {
     hasControls: boolean;
     borderColor: string;
@@ -97,6 +111,130 @@ export abstract class ITextBehavior<
     leftOffset: number;
     topOffset: number;
   };
+
+  override _clearCache() {
+    super._clearCache();
+    this.__rtlEditingGeometry?.clear();
+  }
+
+  /**
+   * Returns insertion boundaries for a uniformly rendered RTL line.
+   *
+   * Fabric's __charBounds are based on grapheme/pair measurements, while an
+   * unbroken Arabic run is shaped contextually as a whole. Measure logical
+   * prefixes without changing the text node so every boundary comes from the
+   * browser-shaped full line.
+   *
+   * Explicit per-character styles do not disable this path when their effective
+   * rendering style is unchanged. This is important after editing operations
+   * that may materialize inherited styles.
+   */
+  protected _getRtlEditingBoundaries(
+    lineIndex: number,
+  ): readonly number[] | undefined {
+    if (
+      this.direction !== RTL ||
+      this.flipX ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes(JUSTIFY)
+    ) {
+      return;
+    }
+
+    const line = this._textLines[lineIndex];
+    if (!line?.length) {
+      return [0];
+    }
+
+    const text = line.join('');
+    if (reNumber.test(text) || !reArabicRtlEditingLine.test(text)) {
+      return;
+    }
+
+    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
+    for (let i = 1; i < line.length; i++) {
+      if (
+        hasStyleChanged(
+          style,
+          this.getCompleteStyleDeclaration(lineIndex, i),
+          false,
+        )
+      ) {
+        return;
+      }
+    }
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      (this.canvas && getDocumentFromElement(this.canvas.getElement())) ||
+      getFabricDocument();
+    const font = this._getFontDeclaration(style);
+    const signature = `${text}\u0000${font}\u0000${this.direction}`;
+    const cached = this.__rtlEditingGeometry?.get(lineIndex);
+
+    if (
+      cached &&
+      cached.document === doc &&
+      cached.signature === signature
+    ) {
+      return cached.boundaries;
+    }
+
+    const boundaries = measureRtlEditingBoundaries({
+      document: doc,
+      graphemes: line,
+      font,
+    });
+    if (!boundaries) {
+      return;
+    }
+
+    if (!doc.fonts || doc.fonts.status !== 'loading') {
+      (this.__rtlEditingGeometry ??= new Map()).set(lineIndex, {
+        document: doc,
+        signature,
+        boundaries,
+      });
+    }
+
+    return boundaries;
+  }
+
+  /**
+   * Converts a shaped RTL boundary into Fabric's cursor leftOffset coordinate.
+   */
+  protected _getRtlEditingCursorLeftOffset(
+    lineIndex: number,
+    charIndex: number,
+  ): number | undefined {
+    const boundary =
+      this._getRtlEditingBoundaries(lineIndex)?.[charIndex];
+    if (boundary === undefined) {
+      return;
+    }
+
+    const lineLeftOffset = this._getLineLeftOffset(lineIndex);
+
+    if (this.textAlign === RIGHT) {
+      return -(lineLeftOffset + boundary);
+    }
+
+    return lineLeftOffset - boundary;
+  }
+
+  protected _getRtlEditingCursorX(
+    lineIndex: number,
+    charIndex: number,
+  ): number | undefined {
+    const leftOffset = this._getRtlEditingCursorLeftOffset(
+      lineIndex,
+      charIndex,
+    );
+    return leftOffset === undefined
+      ? undefined
+      : this._getLeftOffset() + leftOffset;
+  }
 
   /**
    * Initializes all the interactive behavior of IText

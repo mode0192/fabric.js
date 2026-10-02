@@ -506,6 +506,20 @@ export class IText<
     for (let i = 0; i < lineIndex; i++) {
       topOffset += this.getHeightOfLine(i);
     }
+
+    if (direction === RTL) {
+      const shapedLeftOffset = this._getRtlEditingCursorLeftOffset(
+        lineIndex,
+        charIndex,
+      );
+      if (shapedLeftOffset !== undefined) {
+        return {
+          top: topOffset,
+          left: shapedLeftOffset,
+        };
+      }
+    }
+
     const lineLeftOffset = this._getLineLeftOffset(lineIndex);
     const bound = this.__charBounds[lineIndex][charIndex];
     bound && (leftOffset = bound.left);
@@ -693,14 +707,27 @@ export class IText<
             charSpacing;
         }
       }
+
+      const lineStartChar = i === startLine ? startChar : 0;
+      const lineEndChar =
+        i === endLine ? endChar : this._textLines[i].length;
+      const shapedStartX =
+        direction === RTL
+          ? this._getRtlEditingCursorX(i, lineStartChar)
+          : undefined;
+      const shapedEndX =
+        direction === RTL
+          ? this._getRtlEditingCursorX(i, lineEndChar)
+          : undefined;
+
       const realLineHeight = lineHeight;
       if (this.lineHeight < 1 || (i === endLine && this.lineHeight > 1)) {
         lineHeight /= this.lineHeight;
       }
       let drawStart = boundaries.left + lineOffset + boxStart,
         drawHeight = lineHeight,
-        extraTop = 0;
-      const drawWidth = boxEnd - boxStart;
+        extraTop = 0,
+        drawWidth = boxEnd - boxStart;
       if (this.inCompositionMode) {
         ctx.fillStyle = this.compositionColor || 'black';
         drawHeight = 1;
@@ -708,7 +735,10 @@ export class IText<
       } else {
         ctx.fillStyle = this.selectionColor;
       }
-      if (direction === RTL) {
+      if (shapedStartX !== undefined && shapedEndX !== undefined) {
+        drawStart = Math.min(shapedStartX, shapedEndX);
+        drawWidth = Math.abs(shapedEndX - shapedStartX);
+      } else if (direction === RTL) {
         if (
           textAlign === RIGHT ||
           textAlign === JUSTIFY ||

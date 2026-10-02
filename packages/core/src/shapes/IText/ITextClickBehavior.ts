@@ -210,18 +210,49 @@ export abstract class ITextClickBehavior<
         break;
       }
     }
+
+    const lineStart = charIndex;
     const charLength = this._textLines[lineIndex].length;
     // _getLineLeftOffset must be called before reading __charBounds — it lazily populates them via _measureLine
     const lineLeftOffset = this._getLineLeftOffset(lineIndex);
-    const chars = this.__charBounds[lineIndex];
     const isRtl = this.direction === 'rtl';
     const effectiveX = isRtl ? lineLeftOffset - mouseOffset.x : mouseOffset.x;
+
+    if (isRtl) {
+      const boundaries = this._getRtlEditingBoundaries(lineIndex);
+      if (boundaries) {
+        let localIndex = 0;
+        let nearestDistance = Number.POSITIVE_INFINITY;
+
+        for (let i = 0; i <= charLength; i++) {
+          const distance = Math.abs(effectiveX - boundaries[i]);
+          if (distance < nearestDistance) {
+            nearestDistance = distance;
+            localIndex = i;
+          }
+        }
+
+        const resolvedLocalIndex = this.flipX
+          ? charLength - localIndex
+          : localIndex;
+        return Math.min(
+          lineStart + resolvedLocalIndex,
+          this._text.length,
+        );
+      }
+    }
+
+    const chars = this.__charBounds[lineIndex];
     let width = isRtl ? 0 : Math.abs(lineLeftOffset);
+
     for (let j = 0; j < charLength; j++) {
       const charWidth = chars[j].kernedWidth;
       const widthAfter = width + charWidth;
       if (effectiveX <= widthAfter) {
-        if (Math.abs(effectiveX - widthAfter) <= Math.abs(effectiveX - width)) {
+        if (
+          Math.abs(effectiveX - widthAfter) <=
+          Math.abs(effectiveX - width)
+        ) {
           charIndex++;
         }
         break;
