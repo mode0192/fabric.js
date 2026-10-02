@@ -52,6 +52,7 @@
 
     const span = doc.createElement('span');
     span.dir = 'rtl';
+    span.setAttribute('aria-hidden', 'true');
     span.style.cssText = [
       'all: initial',
       'position: fixed',
