@@ -26,6 +26,10 @@
   const sameRenderingStyle = (a, b) =>
     styleKeys.every((key) => a[key] === b[key]);
 
+  const reArabicRtlEditingLine =
+    /^(?:\p{Script_Extensions=Arabic}|\p{Mark}|\p{Separator}|\p{Punctuation}|\p{Symbol}|\s)*$/u;
+  const reNumber = /\p{Number}/u;
+
   const getCache = (target) => {
     let cache = geometryCache.get(target);
     if (!cache) {
@@ -136,6 +140,7 @@
   proto._getRtlEditingBoundaries = function (lineIndex) {
     if (
       this.direction !== 'rtl' ||
+      this.flipX ||
       this.path ||
       this.charSpacing !== 0 ||
       this.textAlign.includes('justify')
@@ -146,6 +151,11 @@
     const line = this._textLines[lineIndex];
     if (!line?.length) {
       return [0];
+    }
+
+    const text = line.join('');
+    if (reNumber.test(text) || !reArabicRtlEditingLine.test(text)) {
+      return undefined;
     }
 
     const style = this.getCompleteStyleDeclaration(lineIndex, 0);
@@ -165,7 +175,6 @@
       this.canvas?.getElement?.()?.ownerDocument ||
       document;
 
-    const text = line.join('');
     const font = this._getFontDeclaration(style);
     const signature = `${text}\u0000${font}\u0000${this.direction}`;
     const cache = getCache(this);
@@ -212,11 +221,7 @@
 
     const lineLeftOffset = this._getLineLeftOffset(lineIndex);
 
-    if (
-      this.textAlign === 'right' ||
-      this.textAlign === 'justify' ||
-      this.textAlign === 'justify-right'
-    ) {
+    if (this.textAlign === 'right') {
       return -(lineLeftOffset + boundary);
     }
 
