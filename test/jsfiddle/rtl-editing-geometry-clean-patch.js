@@ -35,54 +35,19 @@
     return cache;
   };
 
-  proto._getRtlEditingBoundaries = function (lineIndex) {
-    if (
-      this.direction !== 'rtl' ||
-      this.path ||
-      this.charSpacing !== 0 ||
-      this.textAlign.includes('justify')
-    ) {
-      return undefined;
-    }
-
-    const line = this._textLines[lineIndex];
-    if (!line?.length) {
-      return [0];
-    }
-
-    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
-    for (let i = 1; i < line.length; i++) {
-      if (
-        !sameRenderingStyle(
-          style,
-          this.getCompleteStyleDeclaration(lineIndex, i),
-        )
-      ) {
-        return undefined;
-      }
-    }
-
-    const doc =
-      this.hiddenTextarea?.ownerDocument ||
-      this.canvas?.getElement?.()?.ownerDocument ||
-      document;
+  const measureRtlEditingBoundaries = (
+    doc,
+    line,
+    font,
+  ) => {
     const body = doc?.body;
     if (!body || typeof doc.createRange !== 'function') {
       return undefined;
     }
 
     const text = line.join('');
-    const font = this._getFontDeclaration(style);
-    const signature = `${text}\u0000${font}\u0000${this.direction}`;
-    const cache = getCache(this);
-    const cached = cache.get(lineIndex);
-
-    if (
-      cached &&
-      cached.document === doc &&
-      cached.signature === signature
-    ) {
-      return cached.boundaries;
+    if (!text) {
+      return [0];
     }
 
     const span = doc.createElement('span');
@@ -161,18 +126,76 @@
         }
       }
 
-      if (!doc.fonts || doc.fonts.status !== 'loading') {
-        cache.set(lineIndex, {
-          document: doc,
-          signature,
-          boundaries,
-        });
-      }
-
       return boundaries;
     } finally {
       span.remove();
     }
+  };
+
+  proto._getRtlEditingBoundaries = function (lineIndex) {
+    if (
+      this.direction !== 'rtl' ||
+      this.path ||
+      this.charSpacing !== 0 ||
+      this.textAlign.includes('justify')
+    ) {
+      return undefined;
+    }
+
+    const line = this._textLines[lineIndex];
+    if (!line?.length) {
+      return [0];
+    }
+
+    const style = this.getCompleteStyleDeclaration(lineIndex, 0);
+    for (let i = 1; i < line.length; i++) {
+      if (
+        !sameRenderingStyle(
+          style,
+          this.getCompleteStyleDeclaration(lineIndex, i),
+        )
+      ) {
+        return undefined;
+      }
+    }
+
+    const doc =
+      this.hiddenTextarea?.ownerDocument ||
+      this.canvas?.getElement?.()?.ownerDocument ||
+      document;
+
+    const text = line.join('');
+    const font = this._getFontDeclaration(style);
+    const signature = `${text}\u0000${font}\u0000${this.direction}`;
+    const cache = getCache(this);
+    const cached = cache.get(lineIndex);
+
+    if (
+      cached &&
+      cached.document === doc &&
+      cached.signature === signature
+    ) {
+      return cached.boundaries;
+    }
+
+    const boundaries = measureRtlEditingBoundaries(
+      doc,
+      line,
+      font,
+    );
+    if (!boundaries) {
+      return undefined;
+    }
+
+    if (!doc.fonts || doc.fonts.status !== 'loading') {
+      cache.set(lineIndex, {
+        document: doc,
+        signature,
+        boundaries,
+      });
+    }
+
+    return boundaries;
   };
 
   proto._getRtlEditingCursorLeftOffset = function (
@@ -495,11 +518,12 @@
 
   window.__fabricRtlEditingGeometryCleanPatch = {
     commit:
-      '13fefe8ffd70f5a4f64e59100c69807366b7bd14',
+      'e3b7ea85c05385dc96b6baaa6699718773ecf649',
     applied: true,
     usesPrefixRanges: true,
     modifiesRenderer: false,
     modifiesCharBounds: false,
     modifiesDragDrop: false,
+    isolatesDomMeasurement: true,
   };
 })();
